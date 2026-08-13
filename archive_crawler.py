@@ -23,8 +23,12 @@ Examples:
 
 import argparse
 import fnmatch
+import html
 import json
+import re
 import sys
+import textwrap
+from collections import Counter
 from pathlib import Path
 from urllib.parse import quote
 
@@ -80,12 +84,20 @@ def search_identifiers(query, rows=50, mediatype=None, page=1, sort_by_downloads
     return [doc["identifier"] for doc in search_items(query, rows=rows, mediatype=mediatype, page=page, sort_by_downloads=sort_by_downloads)]
 
 
-def get_item_files(identifier):
-    """Return the list of file dicts for an archive.org item."""
+def get_item_metadata(identifier):
+    """Return the full metadata API response for an archive.org item."""
     url = METADATA_URL.format(identifier=identifier)
     resp = requests.get(url, headers={"User-Agent": USER_AGENT})
     resp.raise_for_status()
     data = resp.json()
+    if not data.get("metadata") and not data.get("files"):
+        raise ValueError(f"No such identifier '{identifier}' (does it exist?)")
+    return data
+
+
+def get_item_files(identifier):
+    """Return the list of file dicts for an archive.org item."""
+    data = get_item_metadata(identifier)
     if not data.get("files"):
         raise ValueError(f"No files found for identifier '{identifier}' (does it exist?)")
     return data["files"]
@@ -171,6 +183,70 @@ def format_result_line(doc):
     return f"{ident:<40} | {title}  [{mediatype}, {downloads} downloads]"
 
 
+def clean_html_text(value):
+    """archive.org descriptions are often HTML fragments (possibly a list of
+    them). Strip tags and unescape entities so they read as plain text."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        value = "\n".join(str(v) for v in value)
+    text = re.sub(r"<br\s*/?>", "\n", str(value))
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+def as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def cmd_info(args):
+    """Show an item's description/creator/subjects and a file-type summary
+    so its actual contents can be sanity-checked without downloading it."""
+    identifier = args.identifier
+    try:
+        data = get_item_metadata(identifier)
+    except (requests.RequestException, ValueError) as e:
+        print(f"[error] {e}", file=sys.stderr)
+        sys.exit(1)
+
+    meta = data.get("metadata", {})
+    files = data.get("files", [])
+
+    title = meta.get("title", "(no title)")
+    print(f"{title}")
+    print(f"  identifier : {identifier}")
+    print(f"  url        : https://archive.org/details/{identifier}")
+    if meta.get("mediatype"):
+        print(f"  mediatype  : {meta['mediatype']}")
+    if meta.get("creator"):
+        print(f"  creator    : {', '.join(as_list(meta['creator']))}")
+    if meta.get("date") or meta.get("year"):
+        print(f"  date       : {meta.get('date') or meta.get('year')}")
+    if meta.get("collection"):
+        print(f"  collection : {', '.join(as_list(meta['collection']))}")
+    if meta.get("subject"):
+        print(f"  subjects   : {', '.join(as_list(meta['subject']))}")
+    if meta.get("language"):
+        print(f"  language   : {meta['language']}")
+
+    description = clean_html_text(meta.get("description"))
+    if description:
+        print("\n  description:")
+        for line in description.splitlines():
+            wrapped = textwrap.wrap(line, width=100) or [""]
+            for w in wrapped:
+                print(f"    {w}")
+
+    if files:
+        ext_counts = Counter(Path(f["name"]).suffix.lstrip(".").lower() or "(none)" for f in files)
+        summary = ", ".join(f"{ext}: {count}" for ext, count in sorted(ext_counts.items(), key=lambda kv: -kv[1]))
+        print(f"\n  files      : {len(files)} total ({summary})")
+
+
 def cmd_search(args):
     items = search_items(args.query, rows=args.rows, mediatype=args.mediatype, sort_by_downloads=args.sort_by_downloads)
     for doc in items:
@@ -226,6 +302,10 @@ def build_parser():
     p_search.add_argument("--sort-by-downloads", action="store_true", help="Sort by popularity instead of relevance")
     p_search.add_argument("-o", "--output", help="Write identifiers to this file, one per line")
     p_search.set_defaults(func=cmd_search)
+
+    p_info = sub.add_parser("info", help="Show description/creator/subjects for one identifier, to verify contents before downloading")
+    p_info.add_argument("identifier", help="Archive.org identifier, e.g. MyLittlePonyFull")
+    p_info.set_defaults(func=cmd_info)
 
     p_download = sub.add_parser("download", help="Download files for one or more identifiers")
     p_download.add_argument("identifiers", nargs="*", help="Archive.org identifier(s), e.g. MyLittlePonyFull")
