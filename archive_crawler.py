@@ -28,6 +28,7 @@ import json
 import re
 import sys
 import textwrap
+import zipfile
 from collections import Counter
 from pathlib import Path
 from urllib.parse import quote
@@ -45,6 +46,10 @@ METADATA_URL = "https://archive.org/metadata/{identifier}"
 DOWNLOAD_URL = "https://archive.org/download/{identifier}/{filename}"
 
 USER_AGENT = "archive-crawler/1.0 (+https://archive.org)"
+
+# Archive/container formats are always worth surfacing when filtering by
+# media type, since the media you're after may be bundled inside one.
+ARCHIVE_EXTENSIONS = {"zip", "rar", "7z", "tar", "gz", "tgz", "bz2"}
 
 
 def search_items(query, rows=50, mediatype=None, page=1, sort_by_downloads=False):
@@ -103,6 +108,85 @@ def get_item_files(identifier):
     return data["files"]
 
 
+class HTTPRangeFile:
+    """A read-only, seekable file-like object backed by HTTP Range requests.
+
+    Lets zipfile read just the central directory at the end of a remote zip
+    (a handful of small range reads) instead of downloading the whole file.
+    Raises RuntimeError if the server doesn't support Range requests.
+    """
+
+    def __init__(self, url, session=None):
+        self.url = url
+        self.session = session or requests
+        self._pos = 0
+        head = self.session.head(url, headers={"User-Agent": USER_AGENT}, allow_redirects=True)
+        head.raise_for_status()
+        if "Accept-Ranges" not in head.headers or head.headers.get("Accept-Ranges") == "none":
+            probe = self.session.get(url, headers={"User-Agent": USER_AGENT, "Range": "bytes=0-0"})
+            if probe.status_code != 206:
+                raise RuntimeError("server does not support HTTP Range requests")
+        length = head.headers.get("Content-Length")
+        if length is None:
+            raise RuntimeError("server did not report Content-Length")
+        self._size = int(length)
+
+    def seek(self, offset, whence=0):
+        if whence == 0:
+            self._pos = offset
+        elif whence == 1:
+            self._pos += offset
+        elif whence == 2:
+            self._pos = self._size + offset
+        return self._pos
+
+    def tell(self):
+        return self._pos
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            end = self._size - 1
+        else:
+            end = min(self._pos + size, self._size) - 1
+        if self._pos > end:
+            return b""
+        headers = {"User-Agent": USER_AGENT, "Range": f"bytes={self._pos}-{end}"}
+        resp = self.session.get(self.url, headers=headers)
+        resp.raise_for_status()
+        data = resp.content
+        self._pos += len(data)
+        return data
+
+    def seekable(self):
+        return True
+
+
+def peek_zip_contents(url):
+    """Return a list of (name, size) for entries inside a remote zip file,
+    without downloading it — only its central directory is fetched."""
+    remote = HTTPRangeFile(url)
+    with zipfile.ZipFile(remote) as zf:
+        return [(info.filename, info.file_size) for info in zf.infolist()]
+
+
+def dedupe_ia_variants(files):
+    """archive.org often stores two copies of a video: the original upload
+    and an internal re-encode named identically but with an extra '.ia'
+    before the extension (e.g. 'Foo.mp4' and 'Foo.ia.mp4'). Keep only the
+    larger of each such pair so we don't download the same content twice."""
+    best = {}
+    order = []
+    for f in files:
+        canonical = re.sub(r"\.ia(\.[^./\\]+)$", r"\1", f["name"])
+        size = int(f.get("size") or 0)
+        if canonical not in best:
+            best[canonical] = f
+            order.append(canonical)
+        elif size > int(best[canonical].get("size") or 0):
+            best[canonical] = f
+    return [best[key] for key in order]
+
+
 def matches_filters(filename, extensions, patterns):
     if extensions:
         ext = Path(filename).suffix.lstrip(".").lower()
@@ -143,6 +227,7 @@ def download_identifier(identifier, output_dir, extensions=None, patterns=None, 
         return
 
     selected = [f for f in files if matches_filters(f["name"], extensions, patterns)]
+    selected = dedupe_ia_variants(selected)
     if not selected:
         print(f"  [skip] no files matched filters ({len(files)} total files on item)")
         return
@@ -246,6 +331,36 @@ def cmd_info(args):
         summary = ", ".join(f"{ext}: {count}" for ext, count in sorted(ext_counts.items(), key=lambda kv: -kv[1]))
         print(f"\n  files      : {len(files)} total ({summary})")
 
+    extensions = parse_ext_list(args.ext)
+    if extensions:
+        keep_exts = extensions | ARCHIVE_EXTENSIONS
+        matching = [f for f in files if Path(f["name"]).suffix.lstrip(".").lower() in extensions]
+        print(f"\n  matching '{','.join(sorted(extensions))}' files ({len(matching)}):")
+        for f in matching:
+            print(f"    {f['name']}  ({f.get('size', '?')} bytes)")
+        files = [f for f in files if Path(f["name"]).suffix.lstrip(".").lower() in keep_exts]
+
+    if not args.no_peek_zip:
+        zip_files = [f for f in files if f["name"].lower().endswith(".zip")]
+        for f in zip_files:
+            zip_url = DOWNLOAD_URL.format(identifier=identifier, filename=quote(f["name"]))
+            print(f"\n  contents of {f['name']} (peeked via HTTP range request, not downloaded):")
+            try:
+                entries = peek_zip_contents(zip_url)
+            except (requests.RequestException, RuntimeError, zipfile.BadZipFile) as e:
+                print(f"    [could not peek inside zip: {e}]")
+                continue
+            if extensions:
+                entries = [(name, size) for name, size in entries if Path(name).suffix.lstrip(".").lower() in extensions]
+                if not entries:
+                    print(f"    [no entries matching '{','.join(sorted(extensions))}']")
+                    continue
+            shown = entries[:50]
+            for name, size in shown:
+                print(f"    {name}  ({size} bytes)")
+            if len(entries) > len(shown):
+                print(f"    ... and {len(entries) - len(shown)} more entries")
+
 
 def cmd_search(args):
     items = search_items(args.query, rows=args.rows, mediatype=args.mediatype, sort_by_downloads=args.sort_by_downloads)
@@ -305,6 +420,8 @@ def build_parser():
 
     p_info = sub.add_parser("info", help="Show description/creator/subjects for one identifier, to verify contents before downloading")
     p_info.add_argument("identifier", help="Archive.org identifier, e.g. MyLittlePonyFull")
+    p_info.add_argument("--ext", help="Comma-separated file extensions to focus on, e.g. mp4,srt (archive types like zip/rar/tar are always kept, since the media may be bundled inside)")
+    p_info.add_argument("--no-peek-zip", action="store_true", help="Don't peek inside zip files on the item via HTTP range requests")
     p_info.set_defaults(func=cmd_info)
 
     p_download = sub.add_parser("download", help="Download files for one or more identifiers")
